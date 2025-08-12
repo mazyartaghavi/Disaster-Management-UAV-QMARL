@@ -1,0 +1,446 @@
+# envs/toy_env.py
+import numpy as np
+import gym
+from gym import spaces
+
+class ToyGridEnv(gym.Env):
+    """Lightweight cooperative toy environment for multi-agent experiments.
+
+    Observation: concatenated per-agent observations
+    Action: discrete per-agent action (0..action_size-1)
+    Reward: cooperative reward (coverage + hazard detection)
+    """
+    metadata = {"render.modes": ["human"]}
+
+    def __init__(self, n_agents=4, grid_size=8, max_steps=200, rng_seed=None):
+        super().__init__()
+        self.n_agents = n_agents
+        self.grid_size = grid_size
+        self.max_steps = max_steps
+        self.rng = np.random.RandomState(rng_seed)
+        # simple discrete actions: stay, up, down, left, right
+        self.action_size = 5
+        # per-agent observation: flattened local grid patch (3x3) + agent id one-hot
+        self.obs_size = 9 + n_agents
+        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(self.n_agents, self.obs_size), dtype=np.float32)
+        self.action_space = spaces.MultiDiscrete([self.action_size] * self.n_agents)
+        self.reset()
+
+    def reset(self):
+        self.step_count = 0
+        # initialize agents randomly on the grid
+        self.agent_pos = [ (self.rng.randint(self.grid_size), self.rng.randint(self.grid_size)) for _ in range(self.n_agents) ]
+        # hazards: randomly place a few hazard cells
+        self.hazards = set()
+        for _ in range(max(1, self.grid_size // 3)):
+            self.hazards.add((self.rng.randint(self.grid_size), self.rng.randint(self.grid_size)))
+        return self._get_obs()
+
+    def _get_obs(self):
+        obs = np.zeros((self.n_agents, self.obs_size), dtype=np.float32)
+        for i, (x,y) in enumerate(self.agent_pos):
+            # local 3x3 patch normalized
+            patch = np.zeros(9, dtype=np.float32)
+            idx = 0
+            for dx in [-1,0,1]:
+                for dy in [-1,0,1]:
+                    nx, ny = x+dx, y+dy
+                    patch[idx] = 1.0 if (0 <= nx < self.grid_size and 0 <= ny < self.grid_size and (nx,ny) in self.hazards) else 0.0
+                    idx += 1
+            onehot = np.zeros(self.n_agents, dtype=np.float32)
+            onehot[i] = 1.0
+            obs[i] = np.concatenate([patch, onehot])
+        return obs
+
+    def step(self, actions):
+        self.step_count += 1
+        rewards = 0.0
+        # apply actions
+        new_positions = []
+        for i, a in enumerate(actions):
+            x, y = self.agent_pos[i]
+            if a == 1:
+                x = max(0, x-1)
+            elif a == 2:
+                x = min(self.grid_size-1, x+1)
+            elif a == 3:
+                y = max(0, y-1)
+            elif a == 4:
+                y = min(self.grid_size-1, y+1)
+            new_positions.append((x,y))
+        self.agent_pos = new_positions
+        # reward: +1 per unique hazard observed by any agent this step
+        detected = set()
+        for pos in self.agent_pos:
+            if pos in self.hazards:
+                detected.add(pos)
+        rewards = float(len(detected))
+        # small penalty per step to encourage speed
+        rewards -= 0.01 * self.n_agents
+        done = self.step_count >= self.max_steps or len(self.hazards) == 0
+        obs = self._get_obs()
+        # cooperative reward is shared across agents
+        return obs, np.array([rewards]*self.n_agents, dtype=np.float32), np.array([done]*self.n_agents), {}
+
+    def render(self, mode="human"):
+        grid = np.full((self.grid_size, self.grid_size), '.', dtype=str)
+        for (x,y) in self.hazards:
+            grid[x,y] = 'H'
+        for idx,(x,y) in enumerate(self.agent_pos):
+            grid[x,y] = str(min(9, idx))
+        print("\n".join("".join(row) for row in grid))
+# marl/agent.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MLP(nn.Module):
+    def __init__(self, in_dim, out_dim, hidden_dims=(128,128), activation=nn.ReLU):
+        super().__init__()
+        layers = []
+        last = in_dim
+        for h in hidden_dims:
+            layers.append(nn.Linear(last, h))
+            layers.append(activation())
+            last = h
+        layers.append(nn.Linear(last, out_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+class Actor(nn.Module):
+    def __init__(self, obs_dim, action_dim, hidden=(128,128)):
+        super().__init__()
+        self.model = MLP(obs_dim, action_dim, hidden)
+
+    def forward(self, obs):
+        logits = self.model(obs)
+        return logits  # raw logits for categorical actions
+
+class Critic(nn.Module):
+    def __init__(self, joint_obs_dim, hidden=(256,256)):
+        super().__init__()
+        self.model = MLP(joint_obs_dim, 1, hidden)
+
+    def forward(self, joint_obs):
+        return self.model(joint_obs).squeeze(-1)
+# marl/ctde_base.py
+import torch
+import torch.optim as optim
+import numpy as np
+from marl.agent import Actor, Critic
+from utils.replay_buffer import ReplayBuffer
+
+class CTDETrainer:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.n_agents = cfg["agent"]["n_agents"]
+        self.obs_size = cfg["agent"]["obs_size"]
+        self.action_size = cfg["agent"]["action_size"]
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # create agents
+        self.actors = [Actor(self.obs_size, self.action_size).to(self.device) for _ in range(self.n_agents)]
+        joint_obs_dim = self.n_agents * self.obs_size
+        self.critic = Critic(joint_obs_dim).to(self.device)
+        self.optim_actor = optim.Adam(sum([list(a.parameters()) for a in self.actors], []), lr=cfg["training"]["lr"])
+        self.optim_critic = optim.Adam(self.critic.parameters(), lr=cfg["training"]["lr"])
+        self.replay = ReplayBuffer(capacity=100000, n_agents=self.n_agents, obs_dim=self.obs_size)
+        self.gamma = cfg["training"]["gamma"]
+
+    def select_actions(self, obs, epsilon=0.05):
+        obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
+        actions = []
+        for i,actor in enumerate(self.actors):
+            logits = actor(obs[i])
+            probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
+            if np.random.rand() < epsilon:
+                a = np.random.randint(0, self.action_size)
+            else:
+                a = int(np.argmax(probs))
+            actions.append(a)
+        return actions
+
+    def update(self, batch_size=64):
+        if len(self.replay) < batch_size:
+            return
+        batch = self.replay.sample(batch_size)
+        # unpack batch (simple implementation)
+        obs, actions, rewards, next_obs, dones = batch
+        # convert to tensors
+        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device) # shape [B, n_agents, obs_dim]
+        next_obs_t = torch.tensor(next_obs, dtype=torch.float32, device=self.device)
+        actions_t = torch.tensor(actions, dtype=torch.long, device=self.device)
+        rewards_t = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+        dones_t = torch.tensor(dones, dtype=torch.float32, device=self.device)
+        B = obs_t.shape[0]
+        # flatten joint obs for critic
+        joint_obs = obs_t.view(B, -1)
+        joint_next_obs = next_obs_t.view(B, -1)
+        # critic update (TD(0))
+        with torch.no_grad():
+            target_v = rewards_t[:,0] + (1.0 - dones_t[:,0]) * self.gamma * self.critic(joint_next_obs)
+        v = self.critic(joint_obs)
+        critic_loss = F.mse_loss(v, target_v)
+        self.optim_critic.zero_grad()
+        critic_loss.backward()
+        self.optim_critic.step()
+        # actor update (policy gradient via advantage from central critic)
+        # compute log probs
+        actor_loss = 0.0
+        for i, actor in enumerate(self.actors):
+            logits = actor(obs_t[:,i,:])
+            logp = torch.log_softmax(logits, dim=-1)
+            chosen_logp = logp.gather(1, actions_t[:,i:i+1]).squeeze(-1)
+            with torch.no_grad():
+                advantage = (rewards_t[:,i] + (1.0 - dones_t[:,i]) * self.gamma * self.critic(joint_next_obs) - self.critic(joint_obs))
+            actor_loss = actor_loss - (chosen_logp * advantage).mean()
+        self.optim_actor.zero_grad()
+        actor_loss.backward()
+        self.optim_actor.step()
+# marl/qmix.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MixingNetwork(nn.Module):
+    def __init__(self, n_agents, state_dim, embed_dim=32):
+        super().__init__()
+        self.n_agents = n_agents
+        self.hyper_w1 = nn.Sequential(nn.Linear(state_dim, embed_dim), nn.ReLU(), nn.Linear(embed_dim, n_agents * embed_dim))
+        self.hyper_w2 = nn.Sequential(nn.Linear(state_dim, embed_dim), nn.ReLU(), nn.Linear(embed_dim, embed_dim))
+        self.hyper_b1 = nn.Linear(state_dim, embed_dim)
+        self.hyper_b2 = nn.Sequential(nn.Linear(state_dim, embed_dim), nn.ReLU(), nn.Linear(embed_dim, 1))
+
+    def forward(self, agent_qs, state):
+        # agent_qs: [B, n_agents]
+        B = agent_qs.size(0)
+        w1 = torch.abs(self.hyper_w1(state)).view(B, self.n_agents, -1)  # [B, n_agents, embed]
+        b1 = self.hyper_b1(state).view(B, 1, -1)
+        hidden = F.elu(torch.bmm(agent_qs.unsqueeze(1), w1).squeeze(1) + b1.squeeze(1))
+        w2 = torch.abs(self.hyper_w2(state)).view(B, -1, 1)
+        b2 = self.hyper_b2(state).view(B, 1, 1)
+        y = torch.bmm(hidden.unsqueeze(1), w2).squeeze(1) + b2.squeeze(1)
+        return y.squeeze(-1)
+# utils/replay_buffer.py
+import random
+import numpy as np
+from collections import deque
+
+class ReplayBuffer:
+    def __init__(self, capacity=100000, n_agents=4, obs_dim=16):
+        self.capacity = capacity
+        self.buffer = deque(maxlen=capacity)
+        self.n_agents = n_agents
+        self.obs_dim = obs_dim
+
+    def push(self, obs, actions, rewards, next_obs, dones):
+        # store numpy arrays
+        self.buffer.append((np.array(obs), np.array(actions), np.array(rewards), np.array(next_obs), np.array(dones)))
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        obs, actions, rewards, next_obs, dones = zip(*batch)
+        return np.stack(obs), np.stack(actions), np.stack(rewards), np.stack(next_obs), np.stack(dones)
+
+    def __len__(self):
+        return len(self.buffer)
+# quantum/qaoa_solver.py
+import numpy as np
+
+try:
+    from qiskit import Aer
+    from qiskit.algorithms.optimizers import COBYLA
+    from qiskit.utils import QuantumInstance
+    from qiskit.algorithms import VQE
+    from qiskit.circuit.library import TwoLocal
+    QISKIT_AVAILABLE = True
+except Exception:
+    QISKIT_AVAILABLE = False
+
+class QAOASolver:
+    def __init__(self, use_quantum=False, backend_name="aer_simulator", p=1, maxiter=50):
+        self.use_quantum = use_quantum and QISKIT_AVAILABLE
+        self.p = p
+        self.maxiter = maxiter
+        self.backend_name = backend_name
+
+    def solve(self, cost_matrix):
+        """Solve a small combinatorial optimization instance.
+
+        cost_matrix: numpy array describing pairwise costs (symmetric)
+        Returns: approximate solution vector (0/1)
+        """
+        n = cost_matrix.shape[0]
+        # placeholder: classical greedy solve if quantum unavailable
+        if not self.use_quantum:
+            # simple greedy: choose nodes with negative total cost
+            scores = cost_matrix.sum(axis=1)
+            sol = (scores < 0).astype(int)
+            return sol
+        # If Qiskit available, build a small QAOA/VQE workflow (left as a concise example)
+        # NOTE: full QAOA mapping is problem-specific; here a placeholder VQE with TwoLocal is shown
+        backend = Aer.get_backend(self.backend_name)
+        qi = QuantumInstance(backend)
+        var_form = TwoLocal(rotation_blocks='ry', entanglement_blocks='cz', reps=self.p)
+        optimizer = COBYLA(maxiter=self.maxiter)
+        vqe = VQE(ansatz=var_form, optimizer=optimizer, quantum_instance=qi)
+        # cost operator construction would be required here per problem; replace with placeholder
+        # For expediency, return classical fallback if complex mapping not provided
+        return (np.random.rand(n) > 0.5).astype(int)
+# quantum/hybrid_optimizer.py
+from quantum.qaoa_solver import QAOASolver
+
+class HybridOptimizer:
+    def __init__(self, cfg):
+        self.use_quantum = cfg["quantum"]["use_quantum"]
+        self.qsolver = QAOASolver(use_quantum=self.use_quantum, backend_name=cfg["quantum"]["backend"], p=cfg["quantum"]["qaoa"]["p"], maxiter=cfg["quantum"]["qaoa"]["maxiter"])
+
+    def optimize_action_subset(self, cost_matrix):
+        return self.qsolver.solve(cost_matrix)
+# experiments/train.py
+import argparse
+import yaml
+import os
+import numpy as np
+import torch
+from utils.config import load_config
+from envs.toy_env import ToyGridEnv
+from marl.ctde_base import CTDETrainer
+from utils.logger import get_logger
+
+def run_training(cfg):
+    env_cfg = cfg["env"]
+    env = ToyGridEnv(n_agents=cfg["agent"]["n_agents"], grid_size=8, max_steps=env_cfg["max_steps"], rng_seed=cfg["seed"])
+    trainer = CTDETrainer(cfg)
+    logger = get_logger(cfg["logging"]["logdir"])
+    episodes = cfg["training"]["episodes"]
+    for ep in range(episodes):
+        obs = env.reset()
+        done = False
+        ep_reward = 0.0
+        while True:
+            actions = trainer.select_actions(obs, epsilon=max(0.1, 1.0 - ep / (episodes*0.5)))
+            next_obs, rewards, dones, _ = env.step(actions)
+            trainer.replay.push(obs, actions, rewards, next_obs, dones)
+            trainer.update(batch_size=cfg["training"]["batch_size"])
+            obs = next_obs
+            ep_reward += float(rewards[0])
+            if dones[0]:
+                break
+        logger.info(f"Episode {ep+1}/{episodes} reward={ep_reward:.3f}")
+        if (ep+1) % 50 == 0:
+            # save checkpoint
+            os.makedirs(cfg["logging"]["checkpoint_dir"], exist_ok=True)
+            torch.save({
+                "actors": [a.state_dict() for a in trainer.actors],
+                "critic": trainer.critic.state_dict()
+            }, os.path.join(cfg["logging"]["checkpoint_dir"], f"checkpoint_ep{ep+1}.pt"))
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="configs/default.yaml")
+    args = parser.parse_args()
+    cfg = load_config(args.config)
+    np.random.seed(cfg["seed"])
+    torch.manual_seed(cfg["seed"])
+    run_training(cfg)
+# experiments/evaluate.py
+import argparse
+import yaml
+import numpy as np
+import torch
+import os
+from utils.config import load_config
+from envs.toy_env import ToyGridEnv
+from marl.ctde_base import CTDETrainer
+
+def evaluate(cfg, checkpoint, episodes=10):
+    env = ToyGridEnv(n_agents=cfg["agent"]["n_agents"], grid_size=8, max_steps=cfg["env"]["max_steps"], rng_seed=cfg["seed"])
+    trainer = CTDETrainer(cfg)
+    # load actors
+    ckpt = torch.load(checkpoint, map_location=torch.device("cpu"))
+    for i, a in enumerate(trainer.actors):
+        a.load_state_dict(ckpt["actors"][i])
+    trainer.critic.load_state_dict(ckpt["critic"])
+    metrics = []
+    for ep in range(episodes):
+        obs = env.reset()
+        done = False
+        ep_reward = 0.0
+        while True:
+            actions = trainer.select_actions(obs, epsilon=0.0)
+            obs, rewards, dones, _ = env.step(actions)
+            ep_reward += float(rewards[0])
+            if dones[0]:
+                break
+        metrics.append(ep_reward)
+    print(f"Evaluation mean reward: {np.mean(metrics):.3f} +- {np.std(metrics):.3f}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument("--checkpoint", required=True)
+    args = parser.parse_args()
+    cfg = load_config(args.config)
+    evaluate(cfg, args.checkpoint)
+# utils/config.py
+import yaml
+
+def load_config(path):
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+# utils/logger.py
+import logging
+import os
+
+def get_logger(logdir="./runs"):
+    os.makedirs(logdir, exist_ok=True)
+    logger = logging.getLogger("uav_marl")
+    if not logger.handlers:
+        handler = logging.FileHandler(os.path.join(logdir, "run.log"))
+        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+    return logger
+# envs/airsim_adapter.py
+"""
+Adapter template for AirSim integration.
+
+This file is a skeletal adapter showing how to:
+ - connect to AirSim Python API
+ - convert actions to motor/velocity commands
+ - convert AirSim sensors (RGB/depth/imU) to observations compatible with the MARL pipeline
+
+To use AirSim you must install AirSim and run the Unreal environment.
+AirSim docs: https://microsoft.github.io/AirSim/
+
+This adapter is intentionally minimal. See README for integration notes.
+"""
+# Placeholder only (no imports to avoid requiring AirSim at immediate runtime)
+def connect_airsim():
+    raise NotImplementedError("AirSim integration requires AirSim Python API and Unreal environment.")
+# tests/test_env.py
+from envs.toy_env import ToyGridEnv
+
+def test_reset_step():
+    env = ToyGridEnv(n_agents=3, grid_size=6, max_steps=50, rng_seed=1)
+    obs = env.reset()
+    assert obs.shape[0] == 3
+    actions = [0,0,0]
+    next_obs, rewards, dones, _ = env.step(actions)
+    assert next_obs.shape[0] == 3
+# tests/test_agent_forward.py
+import torch
+from marl.agent import Actor, Critic
+
+def test_forward():
+    actor = Actor(obs_dim=16, action_dim=5)
+    critic = Critic(joint_obs_dim=16*3)
+    x = torch.randn(1,16)
+    logits = actor(x)
+    assert logits.shape[-1] == 5
+    joint = torch.randn(1,16*3)
+    v = critic(joint)
+    assert v.shape == torch.Size([1])
